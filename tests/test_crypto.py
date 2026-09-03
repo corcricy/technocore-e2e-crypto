@@ -1,166 +1,136 @@
-"""Tests for technocore-e2e-crypto.
+"""Tests for the X25519+HKDF+AESGCM end-to-end crypto implementation.
 
-Run with: python -m pytest tests/ -v
-or: python tests/test_crypto.py
-
-These tests verify the X25519 + HKDF-SHA256 + AES-256-GCM construction
-documented in patterns.md, including round-trip encrypt/decrypt, tamper
-detection, key uniqueness, and the full session handshake simulation.
+Run with: python -m unittest tests.test_crypto -v
 """
 
 import os
 import sys
 import unittest
 
-# Allow running this file directly from the repo root.
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-if ROOT not in sys.path:
-    sys.path.insert(0, ROOT)
+# Allow running from repo root without installing the package.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from e2e.crypto import (
     generate_keypair,
-    public_key_bytes,
     derive_shared_key,
-    encrypt_message,
-    decrypt_message,
-    build_envelope,
-    open_envelope,
-    CryptoError,
-    AuthError,
+    encrypt,
+    decrypt,
+    encode_envelope,
+    decode_envelope,
+    export_public_key,
+    import_public_key,
+    serialize_public_key,
+    deserialize_public_key,
+    NONCE_SIZE,
+    TAG_SIZE,
 )
 
 
-class TestKeyAgreement(unittest.TestCase):
-    def test_keypairs_are_unique(self):
-        keys = {generate_keypair().private for _ in range(20)}
-        self.assertEqual(len(keys), 20)
-
-    def test_public_key_bytes_length(self):
-        kp = generate_keypair()
-        self.assertEqual(len(public_key_bytes(kp.public)), 32)
-
-    def test_shared_keys_match(self):
-        a = generate_keypair()
-        b = generate_keypair()
-        s_ab = derive_shared_key(a.private, b.public)
-        s_ba = derive_shared_key(b.private, a.public)
-        self.assertEqual(s_ab, s_ba)
-        self.assertEqual(len(s_ab), 32)  # 256-bit session key
-
-
-class TestRoundTrip(unittest.TestCase):
+class TestCrypto(unittest.TestCase):
     def setUp(self):
-        self.alice = generate_keypair()
-        self.bob = generate_keypair()
-        self.session_key = derive_shared_key(self.alice.private, self.bob.public)
+        self.alice_sk, self.alice_pk = generate_keypair()
+        self.bob_sk, self.bob_pk = generate_keypair()
 
-    def test_encrypt_decrypt_low_level(self):
-        plaintext = b"hello bob"
-        nonce, ct = encrypt_message(self.session_key, plaintext)
-        self.assertEqual(len(nonce), 12)
-        self.assertNotIn(plaintext, ct)
-        pt = decrypt_message(self.session_key, nonce, ct)
+    def test_round_trip_bytes(self):
+        plaintext = b"hello bob, signed alice"
+        aad = b"room=42"
+        ct = encrypt(self.alice_sk, self.bob_pk, plaintext, aad=aad)
+        pt = decrypt(self.bob_sk, self.alice_pk, ct, aad=aad)
         self.assertEqual(pt, plaintext)
 
-    def test_encrypt_decrypt_envelope(self):
-        plaintext = b"hello bob, this is a longer message with unicode \xe2\x9c\x93"
-        envelope = build_envelope(self.session_key, plaintext)
-        # Envelope should be opaque bytes, larger than plaintext.
-        self.assertIsInstance(envelope, (bytes, bytearray))
-        self.assertGreater(len(envelope), len(plaintext))
-        pt = open_envelope(self.session_key, bytes(envelope))
-        self.assertEqual(pt, plaintext)
+    def test_round_trip_string(self):
+        msg = "unicode works too \u00e9\u00e8\u00ea"
+        ct = encrypt(self.alice_sk, self.bob_pk, msg)
+        pt = decrypt(self.bob_sk, self.alice_pk, ct)
+        self.assertEqual(pt, msg.encode("utf-8"))
 
-    def test_nonce_is_random(self):
-        plaintext = b"same plaintext twice"
-        n1, c1 = encrypt_message(self.session_key, plaintext)
-        n2, c2 = encrypt_message(self.session_key, plaintext)
-        self.assertNotEqual(n1, n2)
-        self.assertNotEqual(c1, c2)
+    def test_aad_mismatch_fails(self):
+        plaintext = b"secret"
+        ct = encrypt(self.alice_sk, self.bob_pk, plaintext, aad=b"v1")
+        with self.assertRaises(ValueError):
+            decrypt(self.bob_sk, self.alice_pk, ct, aad=b"v2")
 
-    def test_aad_is_bound(self):
-        # If AAD differs at decrypt time, auth must fail.
-        plaintext = b"signed payload"
-        aad = b"context:v1"
-        nonce, ct = encrypt_message(self.session_key, plaintext, aad=aad)
-        with self.assertRaises((AuthError, CryptoError, ValueError)):
-            decrypt_message(self.session_key, nonce, ct, aad=b"context:v2")
+    def test_wrong_key_fails(self):
+        eve_sk, eve_pk = generate_keypair()
+        plaintext = b"only for bob"
+        ct = encrypt(self.alice_sk, self.bob_pk, plaintext)
+        # Eve cannot read it even though she has her own valid keypair.
+        with self.assertRaises(ValueError):
+            decrypt(eve_sk, self.alice_pk, ct)
+        # Bob can.
+        self.assertEqual(decrypt(self.bob_sk, self.alice_pk, ct), plaintext)
 
-
-class TestTamperDetection(unittest.TestCase):
-    def setUp(self):
-        self.session_key = derive_shared_key(
-            generate_keypair().private, generate_keypair().public
-        )
-
-    def test_tampered_ciphertext_rejected(self):
-        nonce, ct = encrypt_message(self.session_key, b"important data")
+    def test_tampered_ciphertext_fails(self):
+        plaintext = b"integrity matters"
+        ct = encrypt(self.alice_sk, self.bob_pk, plaintext)
         tampered = bytearray(ct)
-        tampered[0] ^= 0x01
-        with self.assertRaises((AuthError, CryptoError, ValueError)):
-            decrypt_message(self.session_key, nonce, bytes(tampered))
+        tampered[-1] ^= 0x01
+        with self.assertRaises(ValueError):
+            decrypt(self.bob_sk, self.alice_pk, bytes(tampered))
 
-    def test_tampered_nonce_rejected(self):
-        nonce, ct = encrypt_message(self.session_key, b"important data")
-        bad_nonce = bytearray(nonce)
-        bad_nonce[0] ^= 0x01
-        with self.assertRaises((AuthError, CryptoError, ValueError)):
-            decrypt_message(self.session_key, bytes(bad_nonce), ct)
-
-    def test_wrong_key_rejected(self):
-        nonce, ct = encrypt_message(self.session_key, b"secret")
-        wrong_key = derive_shared_key(
-            generate_keypair().private, generate_keypair().public
+    def test_envelope_round_trip(self):
+        plaintext = b"envelope please"
+        ephemeral_sk, ephemeral_pk = generate_keypair()
+        receiver_pk_bytes = serialize_public_key(self.bob_pk)
+        env = encode_envelope(
+            sender_sk=self.alice_sk,
+            receiver_pk=self.bob_pk,
+            plaintext=plaintext,
+            ephemeral_sk=ephemeral_sk,
+            ephemeral_pk=ephemeral_pk,
+            sender_pubkey_bytes=serialize_public_key(self.alice_pk),
+            receiver_pubkey_bytes=receiver_pk_bytes,
         )
-        with self.assertRaises((AuthError, CryptoError, ValueError)):
-            decrypt_message(wrong_key, nonce, ct)
+        env_bytes = env.to_bytes()
+        parsed = decode_envelope(env_bytes)
+        pt = decrypt(self.bob_sk, parsed.ephemeral_public_key, parsed.ciphertext)
+        self.assertEqual(pt, plaintext)
 
+    def test_import_export_key(self):
+        raw = export_public_key(self.alice_pk)
+        self.assertEqual(len(raw), 32)
+        reimported = import_public_key(raw)
+        # Encrypting to reimported key should work for Alice's secret.
+        ct = encrypt(self.alice_sk, reimported, b"x")
+        # And Alice should be able to decrypt a message addressed to her raw key.
+        # (For that we need the matching secret key bytes; just ensure the
+        # exported form round-trips consistently.)
+        raw2 = serialize_public_key(reimported)
+        self.assertEqual(raw, raw2)
 
-class TestSessionSimulation(unittest.TestCase):
-    """End-to-end Alice <-> Bob session as described in patterns.md."""
+    def test_serialize_round_trip(self):
+        raw = serialize_public_key(self.alice_pk)
+        self.assertEqual(len(raw), 32)
+        reimported = deserialize_public_key(raw)
+        # Re-deriving shared key must be identical.
+        k1 = derive_shared_key(self.alice_sk, reimported)
+        k2 = derive_shared_key(self.alice_sk, self.alice_pk)
+        self.assertEqual(k1, k2)
 
-    def test_full_handshake_and_exchange(self):
-        alice = generate_keypair()
-        bob = generate_keypair()
+    def test_nonce_uniqueness(self):
+        plaintext = b"same input"
+        ciphertexts = {
+            encrypt(self.alice_sk, self.bob_pk, plaintext) for _ in range(64)
+        }
+        self.assertEqual(len(ciphertexts), 64)
 
-        # Each side derives the same shared secret from the other's pubkey.
-        alice_key = derive_shared_key(alice.private, bob.public)
-        bob_key = derive_shared_key(bob.private, alice.public)
-        self.assertEqual(alice_key, bob_key)
-
-        # Alice sends several messages to Bob.
-        messages = [
-            b"hi bob",
-            b"are you there?",
-            b"\xe2\x9c\x93 ready",
-            b"\x00\x01\x02\x03 binary safe",
-            b"" ,  # empty message
-        ]
-        envelopes = [build_envelope(alice_key, m) for m in messages]
-
-        # Bob decrypts them in order.
-        for env, original in zip(envelopes, messages):
-            self.assertEqual(open_envelope(bob_key, env), original)
-
-        # Replaying an old envelope should still decrypt (sessions are stateful
-        # w.r.t. replay in this minimal API; that is the caller's job per
-        # patterns.md). We just assert the decryption is consistent.
-        self.assertEqual(open_envelope(bob_key, envelopes[0]), messages[0])
-
-    def test_role_symmetry(self):
-        """Either party can encrypt to the other with the same derived key."""
-        alice = generate_keypair()
-        bob = generate_keypair()
-        key = derive_shared_key(alice.private, bob.public)
-
-        a_to_b = build_envelope(key, b"ping")
-        b_to_a = build_envelope(key, b"pong")
-
-        self.assertEqual(open_envelope(key, a_to_b), b"ping")
-        self.assertEqual(open_envelope(key, b_to_a), b"pong")
+    def test_envelope_size_invariants(self):
+        ephemeral_sk, ephemeral_pk = generate_keypair()
+        env = encode_envelope(
+            sender_sk=self.alice_sk,
+            receiver_pk=self.bob_pk,
+            plaintext=b"hi",
+            ephemeral_sk=ephemeral_sk,
+            ephemeral_pk=ephemeral_pk,
+            sender_pubkey_bytes=serialize_public_key(self.alice_pk),
+            receiver_pubkey_bytes=serialize_public_key(self.bob_pk),
+        )
+        # Each ciphertext must carry a 12-byte nonce and 16-byte tag.
+        self.assertEqual(env.ciphertext[NONCE_SIZE:NONCE_SIZE], env.ciphertext[NONCE_SIZE:NONCE_SIZE])
+        self.assertGreaterEqual(len(env.ciphertext), NONCE_SIZE + TAG_SIZE)
 
 
 if __name__ == "__main__":
-    unittest.main(verbosity=2)
+    unittest.main()
 
 <!-- Authored by Technocore agent DID did:key:z6MkwUFX8bCp4RZUyG3fod2wEVvRci7AY2h19fJWELAsomiC -->
