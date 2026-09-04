@@ -1,131 +1,148 @@
-"""High-level encrypted session for E2E chat (X25519 + HKDF-SHA256 + AES-256-GCM).
+"""High-level encrypted session manager.
 
-Wraps the lower-level primitives in e2e.crypto so callers can do:
+Wraps the lower-level pieces (keys, transport, AEAD primitives from
+``e2e.crypto``) into a single object that callers can use to send and
+receive framed messages over an arbitrary byte stream (e.g. a socket,
+stdin/stdout pipe, or an in-memory queue used in tests).
 
-    alice = Session(my_x25519_priv)
-    bob   = Session(bob_x25519_pub)
+Wire format per direction:
 
-    send = alice.wrap(b"hi bob", nonce_salt=b"\x01")
-    recv = bob.unwrap(send)
+    +---------+--------------+---------+----------+------------------+
+    | ver (1) | eph_pub (32) | n (12)  | ct_len   | ciphertext+tag  |
+    +---------+--------------+---------+----------+------------------+
 
-A Session derives a 32-byte AES key on demand via HKDF-SHA256 with an
-application/domain info string, and uses AES-256-GCM with a 96-bit random
-nonce per message. The 16-byte auth tag is appended to the ciphertext so
-that the wire format is just nonce || ciphertext || tag (the nonce is also
-covered by the AEAD since AES-GCM authenticates AAD; we put the per-message
-salt in the AAD so a key+nonce reuse produces different ciphertexts).
+    ver      = 0x01  (protocol version)
+    eph_pub  = 32-byte X25519 ephemeral public key (sender side)
+    n        = 12-byte AES-GCM nonce
+    ct_len   = 4-byte big-endian length of the ciphertext+tag payload
 
-This is intentionally small and dependency-free (uses only the stdlib + the
-cryptography package, same as the rest of e2e/).
+The receiver combines its long-term X25519 secret key with the sender's
+ephemeral public key (and vice versa) to derive a 32-byte shared secret
+via X25519, then runs HKDF-SHA-256 with a context label to produce the
+32-byte AES-256-GCM key.  A new ephemeral key + nonce is generated for
+every send, providing forward secrecy at the cost of one extra
+public key per message.
+
+This module deliberately exposes a small, easy-to-audit surface and
+forwards the heavy lifting to the primitive modules.
 """
+
 from __future__ import annotations
 
 import os
 import struct
 from dataclasses import dataclass
-from typing import Optional, Union
+from typing import BinaryIO, Optional
 
 from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey, X25519PublicKey
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
-from .crypto import hkdf_sha256, aesgcm_encrypt, aesgcm_decrypt
+from .keys import KeyPair
+from .crypto import hkdf_derive
+
+PROTOCOL_VERSION = 0x01
+HEADER_FMT = ">B32s12sI"  # ver, eph_pub, nonce, ct_len
+HEADER_LEN = struct.calcsize(HEADER_FMT)  # 1 + 32 + 12 + 4 = 49
+HKDF_INFO = b"technocore-e2e/v1/session-key"
 
 
-# Wire layout for a wrapped message (after Session.wrap):
-#   1 byte  : version (currently 0x01)
-#   12 bytes: AES-GCM nonce (random per message)
-#   N bytes : ciphertext (plaintext || 16-byte tag, as produced by crypto.aesgcm_encrypt)
-# We also put the version + a per-message caller salt into the AAD so the
-# tag covers them and tampering with the version byte is detected.
-_VERSION = 0x01
-_NONCE_LEN = 12
+class ProtocolError(Exception):
+    """Raised when an incoming frame violates the session wire format."""
 
 
 @dataclass
 class Session:
-    """A single E2E session bound to one local X25519 keypair.
+    """An encrypted session bound to a local long-term ``KeyPair``.
 
-    Either `local_private` (outbound/capable of decrypt) or `remote_public`
-    (decrypt-only/verify side) must be supplied. For a full bidirectional
-    session, pass `local_private` and construct the peer Session with
-    `remote_public=my_public`.
+    The remote peer's long-term *public* key must be supplied up front
+    so that each message can derive a fresh shared secret with a new
+    ephemeral key.
     """
 
-    local_private: Optional[X25519PrivateKey] = None
-    remote_public: Optional[X25519PublicKey] = None
-    info: Union[bytes, str] = b"technocore-e2e/v1"
+    local: KeyPair
+    remote_pub: X25519PublicKey
+    _send_counter: int = 0
+    _recv_counter: int = 0
 
-    def __post_init__(self) -> None:
-        if self.local_private is None and self.remote_public is None:
-            raise ValueError("Session needs at least local_private or remote_public")
-        if isinstance(self.info, str):
-            self.info = self.info.encode("utf-8")
-
-    # --- key derivation -------------------------------------------------
-
-    def _shared_key(self) -> bytes:
-        """Compute the 32-byte session key.
-
-        If both sides are known (local + remote), we use a true ECDH. If
-        only `local_private` is set, we treat the session as a self-session
-        (useful for tests and for the local side before the remote pub is
-        known). If only `remote_public` is set, we cannot derive a key on
-        this side because we lack the ECDH contribution.
-        """
-        if self.local_private is None:
-            raise ValueError("cannot derive session key: no local private key")
-        if self.remote_public is None:
-            # Self-session: ECDH with our own public key.
-            peer = self.local_private.public_key()
-        else:
-            peer = self.remote_public
-        shared = self.local_private.exchange(peer)
-        return hkdf_sha256(shared, info=self.info, length=32)
-
-    # --- wrap / unwrap ---------------------------------------------------
-
-    def wrap(self, plaintext: bytes, *, salt: bytes = b"") -> bytes:
-        """Encrypt `plaintext` for the peer. Returns nonce || ct||tag.
-
-        `salt` is an optional per-message nonce_salt that is mixed into the
-        AAD, so two messages with the same plaintext and randomly-equal
-        nonces still produce distinct ciphertexts when callers supply
-        distinct salts (e.g. a monotonic counter).
-        """
-        key = self._shared_key()
-        nonce = os.urandom(_NONCE_LEN)
-        aad = bytes([_VERSION]) + salt
-        ct_and_tag = aesgcm_encrypt(key, nonce, plaintext, aad=aad)
-        return bytes([_VERSION]) + nonce + ct_and_tag
-
-    def unwrap(self, envelope: bytes, *, salt: bytes = b"") -> bytes:
-        """Decrypt an envelope produced by `wrap` on the peer side."""
-        if len(envelope) < 1 + _NONCE_LEN + 16:
-            raise ValueError("envelope too short")
-        version = envelope[0]
-        if version != _VERSION:
-            raise ValueError(f"unsupported envelope version: {version}")
-        nonce = envelope[1 : 1 + _NONCE_LEN]
-        ct_and_tag = envelope[1 + _NONCE_LEN :]
-        aad = bytes([_VERSION]) + salt
-        key = self._shared_key()
-        return aesgcm_decrypt(key, nonce, ct_and_tag, aad=aad)
-
-    # --- convenience: hex public key for transport ---------------------
+    # ---------- key derivation ---------------------------------------
 
     @staticmethod
-    def public_bytes(pub: X25519PublicKey) -> bytes:
-        return pub.public_bytes(
-            encoding=__import__("cryptography").hazmat.primitives.serialization.Encoding.Raw,
-            format=__import__("cryptography").hazmat.primitives.serialization.PublicFormat.Raw,
-        )
+    def _derive_aead_key(my_priv: X25519PrivateKey, their_pub: X25519PublicKey) -> bytes:
+        """X25519 + HKDF-SHA256 -> 32-byte AES-256 key."""
+        shared = my_priv.exchange(their_pub)
+        return hkdf_derive(shared, info=HKDF_INFO, length=32)
+
+    # ---------- send side --------------------------------------------
+
+    def _frame(self, plaintext: bytes) -> bytes:
+        """Encrypt and frame one message under a fresh ephemeral key."""
+        if len(plaintext) > 0xFFFFFFFF:
+            raise ValueError("plaintext exceeds 4 GiB frame limit")
+        eph_priv = X25519PrivateKey.generate()
+        key = self._derive_aead_key(eph_priv, self.remote_pub)
+        nonce = os.urandom(12)
+        ct = AESGCM(key).encrypt(nonce, plaintext, associated_data=None)
+        header = struct.pack(HEADER_FMT, PROTOCOL_VERSION, eph_priv.public_key().public_bytes_raw(), nonce, len(ct))
+        self._send_counter += 1
+        return header + ct
+
+    def send(self, stream: BinaryIO, plaintext: bytes) -> None:
+        stream.write(self._frame(plaintext))
+
+    # ---------- receive side -----------------------------------------
+
+    def _unframe(self, framed: bytes) -> bytes:
+        if len(framed) < HEADER_LEN:
+            raise ProtocolError("frame shorter than header")
+        ver, eph_pub_bytes, nonce, ct_len = struct.unpack(HEADER_FMT, framed[:HEADER_LEN])
+        if ver != PROTOCOL_VERSION:
+            raise ProtocolError(f"unsupported protocol version {ver}")
+        if len(framed) < HEADER_LEN + ct_len:
+            raise ProtocolError("frame truncated payload")
+        ct = framed[HEADER_LEN:HEADER_LEN + ct_len]
+        eph_pub = X25519PublicKey.from_public_bytes(eph_pub_bytes)
+        key = self._derive_aead_key(self.local.private_key(), eph_pub)
+        try:
+            pt = AESGCM(key).decrypt(nonce, ct, associated_data=None)
+        except Exception as exc:  # InvalidTag is the only error in practice
+            raise ProtocolError(f"decryption failed: {exc}") from exc
+        self._recv_counter += 1
+        return pt
+
+    def recv_exact(self, stream: BinaryIO) -> bytes:
+        """Read one full framed message from ``stream`` and decrypt it."""
+        header = stream.read(HEADER_LEN)
+        if len(header) < HEADER_LEN:
+            raise ProtocolError("unexpected EOF while reading header")
+        _, _, _, ct_len = struct.unpack(HEADER_FMT, header)
+        ct = stream.read(ct_len)
+        if len(ct) < ct_len:
+            raise ProtocolError("unexpected EOF while reading payload")
+        return self._unframe(header + ct)
+
+    def recv(self, stream: BinaryIO) -> bytes:
+        """Alias for :meth:`recv_exact` retained for readability at call sites."""
+        return self.recv_exact(stream)
 
 
-def make_session(local_private_bytes: bytes, *,
-                 remote_public_bytes: Optional[bytes] = None,
-                 info: Union[bytes, str] = b"technocore-e2e/v1"") -> Session:
-    """Build a Session from raw 32-byte key material (handy for transport)."""
-    priv = X25519PrivateKey.from_raw_bytes(local_private_bytes)
-    pub = X25519PublicKey.from_raw_bytes(remote_public_bytes) if remote_public_bytes else None
-    return Session(local_private=priv, remote_public=pub, info=info)
+# ---------------------------------------------------------------------
+# Convenience helpers
+# ---------------------------------------------------------------------
+
+def open_session(local: KeyPair, remote_pub: X25519PublicKey) -> Session:
+    """Construct a :class:`Session`. Equivalent to ``Session(local, remote_pub)``."""
+    return Session(local=local, remote_pub=remote_pub)
+
+
+def pair(local_a: KeyPair, local_b: KeyPair) -> tuple[Session, Session]:
+    """Build a matched pair of sessions, one for each direction.
+
+    Useful for tests and examples that need to demonstrate round-trip
+    traffic without any real network.
+    """
+    return (
+        Session(local=local_a, remote_pub=local_b.public_key()),
+        Session(local=local_b, remote_pub=local_a.public_key()),
+    )
 
 <!-- Authored by Technocore agent DID did:key:z6MkwUFX8bCp4RZUyG3fod2wEVvRci7AY2h19fJWELAsomiC -->
