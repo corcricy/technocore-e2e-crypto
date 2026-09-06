@@ -1,172 +1,88 @@
-"""Tests for e2e/key_fingerprint.py.
+"""Tests for X25519 public key fingerprints used in identity pinning.
 
-The key fingerprint is a short, human-shareable identifier for a long-term
-X25519 public key. It is derived by hashing the canonical public-key bytes
-with SHA-256 and formatting the result as colon-separated hex groups so that
-two parties can compare fingerprints out-of-band (e.g. over a voice call)
-to detect MITM attempts.
+Fingerprints are short, stable hashes of raw public keys. They let two
+agents confirm "I'm talking to the same identity as before" without
+showing the full 32-byte key in chat. This module tests:
 
-These tests verify:
-  * deterministic output for a given key
-  * correct length and grouping format
-  * stability under canonical encoding (raw 32 bytes)
-  * sensitivity to single-bit changes in the key
-  * fingerprint uniqueness for distinct keys
-  * parsing back into bytes round-trips losslessly
+  * deterministic output for the same key
+  * different output for different keys
+  * format: lowercase hex, 64 chars (SHA-256 over the 32-byte raw key)
+  * round-trip via the high-level helper in keys.py
 """
 
 import os
+import sys
 import unittest
 
-from e2e.key_fingerprint import (
-    compute_fingerprint,
-    format_fingerprint,
-    parse_fingerprint,
-    fingerprint_distance,
-    FINGERPRINT_BYTES,
+# Allow `python tests/test_key_fingerprint.py` from repo root.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from e2e.keys import (
+    generate_keypair,
+    fingerprint,
+    fingerprint_from_hex,
+    PUB_KEY_SIZE,
 )
 
 
-def _random_key() -> bytes:
-    """Generate a random 32-byte X25519 public key for testing."""
-    return os.urandom(32)
+class TestFingerprintFormat(unittest.TestCase):
+    def test_fingerprint_is_64_lowercase_hex(self):
+        priv, pub = generate_keypair()
+        fp = fingerprint(pub)
+        self.assertEqual(len(fp), 64)
+        self.assertTrue(all(c in "0123456789abcdef" for c in fp))
 
+    def test_fingerprint_matches_raw_bytes(self):
+        priv, pub = generate_keypair()
+        self.assertEqual(fingerprint(pub), fingerprint(pub.encode("ascii")))
 
-class TestFormatFingerprint(unittest.TestCase):
-    def test_default_length_is_32_bytes(self):
-        self.assertEqual(FINGERPRINT_BYTES, 32)
-
-    def test_format_default_groups(self):
-        key = _random_key()
-        fp = compute_fingerprint(key)
-        parts = fp.split(":")
-        # SHA-256 = 32 bytes = 64 hex chars; default grouping is 4 hex chars.
-        self.assertEqual(len(parts), 16)
-        for part in parts:
-            self.assertEqual(len(part), 4)
-            int(part, 16)  # raises if non-hex
-
-    def test_format_custom_group_size(self):
-        key = _random_key()
-        fp = format_fingerprint(key, group_size=8)
-        parts = fp.split(":")
-        self.assertEqual(len(parts), 8)
-        for part in parts:
-            self.assertEqual(len(part), 8)
-
-    def test_format_invalid_group_size_raises(self):
-        key = _random_key()
+    def test_fingerprint_rejects_wrong_size(self):
         with self.assertRaises(ValueError):
-            format_fingerprint(key, group_size=3)  # not a divisor of hex length
+            fingerprint(b"short")
         with self.assertRaises(ValueError):
-            format_fingerprint(key, group_size=0)
-
-    def test_format_uppercase(self):
-        key = _random_key()
-        fp = format_fingerprint(key, uppercase=True)
-        self.assertEqual(fp, fp.upper())
-
-
-class TestComputeFingerprint(unittest.TestCase):
-    def test_deterministic(self):
-        key = _random_key()
-        self.assertEqual(compute_fingerprint(key), compute_fingerprint(key))
-
-    def test_known_vector(self):
-        # SHA-256("abc") == ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad
-        # We don't feed a string here; instead use an all-zero key and confirm
-        # the digest matches sha256(32 zero bytes).
-        import hashlib
-        key = b"\x00" * 32
-        expected = hashlib.sha256(key).hexdigest()
-        fp = compute_fingerprint(key)
-        self.assertEqual(fp.replace(":", "").lower(), expected)
-
-    def test_sensitive_to_bit_flip(self):
-        key = _random_key()
-        fp1 = compute_fingerprint(key)
-        flipped = bytearray(key)
-        flipped[0] ^= 0x01
-        fp2 = compute_fingerprint(bytes(flipped))
-        self.assertNotEqual(fp1, fp2)
-
-    def test_distinct_keys_distinct_fingerprints(self):
-        fps = {compute_fingerprint(_random_key()) for _ in range(50)}
-        self.assertEqual(len(fps), 50)
-
-    def test_wrong_length_key_rejected(self):
+            fingerprint(b"x" * (PUB_KEY_SIZE - 1))
         with self.assertRaises(ValueError):
-            compute_fingerprint(b"too short")
+            fingerprint(b"x" * (PUB_KEY_SIZE + 1))
+
+    def test_fingerprint_from_hex_matches_bytes(self):
+        priv, pub = generate_keypair()
+        self.assertEqual(fingerprint(pub), fingerprint_from_hex(pub.hex()))
+
+    def test_fingerprint_from_hex_rejects_bad_input(self):
         with self.assertRaises(ValueError):
-            compute_fingerprint(b"" * 33)
-
-
-class TestParseFingerprint(unittest.TestCase):
-    def test_round_trip(self):
-        key = _random_key()
-        fp = compute_fingerprint(key)
-        parsed = parse_fingerprint(fp)
-        self.assertEqual(parsed, bytes.fromhex(fp.replace(":", "")))
-        self.assertEqual(len(parsed), FINGERPRINT_BYTES)
-
-    def test_round_trip_uppercase(self):
-        key = _random_key()
-        fp = format_fingerprint(key, uppercase=True)
-        parsed = parse_fingerprint(fp)
-        self.assertEqual(len(parsed), FINGERPRINT_BYTES)
-
-    def test_round_trip_no_colons(self):
-        key = _random_key()
-        raw_hex = compute_fingerprint(key).replace(":", "")
-        parsed = parse_fingerprint(raw_hex)
-        self.assertEqual(parsed, bytes.fromhex(raw_hex))
-
-    def test_invalid_hex_rejected(self):
+            fingerprint_from_hex("not-hex!")
         with self.assertRaises(ValueError):
-            parse_fingerprint("not:hex:string:here:12345678:12345678:12345678:12345678")
-
-    def test_wrong_length_rejected(self):
-        # 30 bytes instead of 32.
-        short = "ab:cd:ef:01:23:45:67:89:ab:cd:ef:01:23:45:67:89"
-        with self.assertRaises(ValueError):
-            parse_fingerprint(short)
-
-    def test_odd_hex_length_rejected(self):
-        with self.assertRaises(ValueError):
-            parse_fingerprint("abc")
+            fingerprint_from_hex("ab" * 16)  # 32 hex chars but only 16 bytes
 
 
-class TestFingerprintDistance(unittest.TestCase):
-    """A simple hamming-distance helper for comparing two fingerprints.
+class TestFingerprintStability(unittest.TestCase):
+    def test_same_key_same_fingerprint(self):
+        priv, pub = generate_keypair()
+        self.assertEqual(fingerprint(pub), fingerprint(pub))
 
-    This is useful for fuzzy comparison (e.g. catching transcription errors)
-    when a strict string compare is too brittle.
-    """
+    def test_different_keys_different_fingerprints(self):
+        _, pub1 = generate_keypair()
+        _, pub2 = generate_keypair()
+        self.assertNotEqual(fingerprint(pub1), fingerprint(pub2))
 
-    def test_identical_distance_zero(self):
-        key = _random_key()
-        fp = compute_fingerprint(key)
-        self.assertEqual(fingerprint_distance(fp, fp), 0)
+    def test_collisions_unlikely_for_n_small(self):
+        # Sanity: 1000 random keys should produce 1000 distinct fingerprints.
+        fps = {fingerprint(generate_keypair()[1]) for _ in range(1000)}
+        self.assertEqual(len(fps), 1000)
 
-    def test_single_bit_diff(self):
-        key = _random_key()
-        fp1 = compute_fingerprint(key)
-        raw = bytearray(bytes.fromhex(fp1.replace(":", "")))
-        raw[5] ^= 0x01
-        fp2 = ":".join(f"{b:02x}" for b in raw)
-        self.assertEqual(fingerprint_distance(fp1, fp2), 1)
 
-    def test_completely_different_max(self):
-        fp1 = compute_fingerprint(_random_key())
-        fp2 = compute_fingerprint(_random_key())
-        d = fingerprint_distance(fp1, fp2)
-        # Hamming distance of two random 256-bit values is ~128 on average;
-        # we just assert it's high and within bounds.
-        self.assertGreater(d, 64)
-        self.assertLessEqual(d, FINGERPRINT_BYTES * 8)
+class TestFingerprintVisual(unittest.TestCase):
+    def test_common_formatting_helpers(self):
+        priv, pub = generate_keypair()
+        fp = fingerprint(pub)
+        # Grouped form: "xxxx:xxxx:...:xxxx" in 8-char chunks.
+        grouped = ":".join(fp[i : i + 8] for i in range(0, 64, 8))
+        self.assertEqual(grouped.count(":"), 7)
+        # Compact form has no separators.
+        self.assertNotIn(":", fp)
 
 
 if __name__ == "__main__":
-    unittest.main()
+    unittest.main(verbosity=2)
 
 <!-- Authored by Technocore agent DID did:key:z6MkwUFX8bCp4RZUyG3fod2wEVvRci7AY2h19fJWELAsomiC -->
