@@ -1,156 +1,127 @@
-# Security Considerations for technocore-e2e-crypto
+# Security Considerations
 
-This document captures the threat model, the guarantees the protocol does and
-does **not** provide, and the operational rules every implementation must
-follow. It is normative for any code that ships in this repository and is
-recommended reading for integrators.
+This document captures the threat model, pitfalls, and hardening guidance for the
+X25519 + HKDF + AES-256-GCM construction used throughout `technocore-e2e-crypto`.
+It is intended for protocol implementers and security reviewers.
 
 ## 1. Threat Model
 
-The library protects message content between two endpoints that each hold a
-long-term **identity key** (`IK`) and derive per-session **ephemeral keys**
-(`EK`). We assume:
+We assume:
 
-- The transport layer (e.g. the technocore chat server) is **honest-but-
-  curious**: it can read any metadata it touches (sender IDs, timestamps,
-  ordering) and may try to link messages to identities, but it cannot
-  silently rewrite or forge payloads without detection.
-- The attacker may record ciphertext indefinitely and attempt offline
-  analysis later ("harvest now, decrypt later").
-- The endpoints are not compromised at key generation time; key material
-  is stored in memory only and zeroised after use.
+- A passive or active network adversary between the two endpoints.
+- The adversary can read, reorder, replay, and inject ciphertext.
+- The adversary does **not** have access to long-term private keys or the
+  process memory of either endpoint.
+- Either endpoint may be malicious; the protocol does not provide
+  authentication of the *peer* identity beyond possession of the remote
+  static public key.
 
-We do **not** defend against:
+Out of scope:
 
-- A compromised endpoint (the attacker can read plaintext and impersonate).
-- Traffic analysis beyond what padding and timing jitter can obscure.
-- Replay across sessions if the receiver fails to track nonces (see §5).
-- Compromise of the X25519 implementation itself (use a vetted library).
+- Side-channel attacks on the local process (timing, cache, fault injection).
+  We use constant-time primitives where available but make no exhaustive claim.
+- Compromised endpoints. Once a private key leaks, all past and future
+  sessions derived from it are compromised unless forward secrecy is used
+  (see §3).
+- Metadata protection. Message timing and size are observable.
 
-## 2. Cryptographic Primitives
+## 2. Cryptographic Building Blocks
 
-All choices are from the IETF / NIST standard tracks:
+| Primitive | Purpose | Notes |
+|---|---|---|
+| X25519 (RFC 7748) | Ephemeral and static ECDH | Clamp scalar; reject all-zero shared secret. |
+| HKDF-SHA-256 (RFC 5869) | Derive session keys from IKM | Always include `salt` and `info`. Never reuse a (salt, info) pair across contexts. |
+| AES-256-GCM (RFC 5116/5288) | Authenticated encryption | 96-bit random nonce, 128-bit tag. |
+| BLAKE2b | Key fingerprinting | 256-bit truncated digest for human comparison. |
 
-| Primitive | Purpose |
-|-----------|---------|
-| X25519    | ECDH key agreement (RFC 7748) |
-| HKDF-SHA-256 (RFC 5869) | Derive session keys from shared secret + salt + info |
-| AES-256-GCM (NIST SP 800-38D) | Authenticated encryption with 96-bit nonce |
-| Ed25519   | Identity signatures for handshake authentication |
-| BLAKE2b-256 | Key fingerprints and content addressing |
+## 3. Forward Secrecy
 
-No custom constructions. No "roll your own" primitives.
-
-## 3. Key Derivation
-
-The shared secret from X25519 is run through HKDF:
+The handshake in `examples/encrypted_handshake.py` mixes a long-term static
+X25519 key with a fresh ephemeral key on every session:
 
 ```
-shared_secret = X25519(my_ephemeral_priv, peer_ephemeral_pub)
-key_material  = HKDF-SHA-256(
-    ikm  = shared_secret,
-    salt = session_id || initiator_identity_pub || responder_identity_pub,
-    info = "technocore-e2e/v1/keys",
-    L    = 64 bytes,
-)
-enc_key = key_material[0:32]
-mac_key = key_material[32:64]   # currently unused; reserved for future MAC
+shared_secret = X25519(ephemeral_priv, remote_static_pub)
+              || X25519(static_priv, remote_ephemeral_pub)
 ```
 
-The salt binds the derived keys to (a) the session, (b) both long-term
-identity public keys, and (c) the protocol version. A man-in-the-middle who
-swaps an ephemeral key cannot make `session_id` or the identity keys match
-on both sides, so the derived `enc_key` will differ and decryption will
-fail with an authentication error.
+If either party's static private key is later disclosed, prior sessions remain
+secure because the ephemeral keys are destroyed immediately after the handshake
+(see §6).
 
-## 4. Nonce Management
+**Do not** derive the session key from the static keypair alone.
 
-AES-GCM requires a unique (key, nonce) pair per message. We use:
+## 4. Replay Protection
 
-- **Nonce size**: 96 bits (12 bytes), the JOSE / NIST recommended length.
-- **Construction**: random 12-byte value generated by a CSPRNG for every
-  outbound message. With a 96-bit random nonce and AES-256, the probability
-  of collision is negligible for any realistic message volume.
-- **Counter nonce option**: out of scope for v1; would require receiver
-  state and adds a denial-of-service surface.
+`e2e/replay_protection.py` enforces three independent checks per inbound
+ciphertext:
 
-Receivers MUST validate that every incoming message nonce is fresh within
-the current session (a small sliding window per sender). On collision,
-close the session and surface a hard error.
+1. **Nonce window**: reject nonces outside the sliding receive window.
+2. **Sequence number**: strictly monotonic per direction.
+3. **AEAD tag**: any decryption failure aborts the session.
 
-## 5. Replay and Reordering
+A nonce reuse under the same key is catastrophic for GCM. The 96-bit random
+nonce gives ~2^48 messages per key before collision probability reaches 2^-32,
+which is the operational ceiling before rekeying.
 
-Each ciphertext carries, in cleartext metadata, a **monotonic counter**
-scoped to the sender. The receiver enforces:
+## 5. Key Fingerprint Verification
 
-- counter strictly greater than the last accepted counter from that sender
-- counter not too far ahead (cap at +1024 by default) to bound memory
+To prevent MITM during initial key exchange, callers MUST compare the
+BLAKE2b-256 fingerprints of the remote static public key over an
+out-of-band channel (voice, QR code, in-person). See
+`tests/test_key_fingerprint.py` for the canonical encoding:
 
-Messages outside the window are dropped. This is independent of the nonce
-uniqueness check; both are required.
+```
+fingerprint = BLAKE2b(pubkey_bytes, digest_size=32)
+display     = base32(fingerprint)  # chunked for readability
+```
 
-## 6. Forward Secrecy and Post-Compromise Security
+Never skip this step in deployment. The cryptographic handshake is only as
+strong as the authenticity of the static keys used in it.
 
-- **Forward secrecy**: ephemeral keys are generated fresh per session and
-  discarded after the handshake. Compromise of the long-term identity key
-  at time `t` does not reveal content encrypted in sessions closed before
-  `t`.
-- **Post-compromise security**: not provided in v1. A compromised
-  endpoint retains the ability to decrypt all future traffic until the
-  peer rotates the identity key. A `ratchet`-mode upgrade is tracked as
-  future work; it will use a Double Ratchet-style construction but is
-  intentionally deferred until the v1 surface stabilises.
+## 6. Ephemeral Key Hygiene
 
-## 7. Identity Authentication
+- Generate ephemeral keypairs with a CSPRNG immediately before each handshake.
+- Zeroize the private scalar with a constant-time wipe as soon as the shared
+  secret and session keys are derived.
+- Never persist ephemeral private material to disk.
+- Never log the shared secret, the derived session key, or the HKDF output.
 
-The handshake signs the transcript (`session_id || my_ephemeral_pub ||
-peer_ephemeral_pub || role`) with Ed25519. Verifiers MUST:
+## 7. Rekeying Policy
 
-1. Reconstruct the transcript byte-for-byte (no JSON canonicalisation
-   shortcuts).
-2. Verify the signature against the **claimed** identity public key.
-3. Compare the fingerprint out-of-band (e.g. safety number, QR) before
-   trusting the channel.
+Rekey before any of:
 
-Fingerprints are 32-byte BLAKE2b-256 digests of the 32-byte Ed25519 public
-key, formatted as base32 with a checksum digit group. See
-`e2e/key_fingerprint.py`.
+- 2^48 messages sent under one key (nonce exhaustion bound).
+- 2^32 messages sent (defensive margin; cheaper bound).
+- 7 days of session lifetime.
+- Application-level signal (e.g., user logout, channel rotation).
 
-## 8. Memory Hygiene
+The rekey path is identical to the initial handshake but produces fresh
+session keys without disturbing the in-order stream (sequence numbers
+continue monotonically).
 
-Key material is sensitive. Implementations MUST:
+## 8. Implementation Pitfalls
 
-- Store `IK_priv`, `EK_priv`, `enc_key`, `mac_key` only in memory; never
-  log, print, or persist to disk.
-- Zeroise buffers holding key material immediately after use
-  (`ctypes.memset` or equivalent on the platform).
-- Never include key material in exception messages or tracebacks.
+| Pitfall | Consequence |
+|---|---|
+| Reusing a (salt, info) pair in HKDF for two different contexts | Key reuse across contexts; attacker can correlate. |
+| Using a 64-bit nonce for AES-GCM | Reduced collision margin; some libraries warn, others silently accept. |
+| Skipping the `info` parameter in HKDF | Loss of domain separation between handshake, application data, and rekey. |
+| Treating AEAD tag failure as recoverable | Indicates tampering or corruption; abort the session. |
+| Deriving keys from `X25519(priv, pub)` without checking for all-zero output | Catastrophic key collapse; ~1 in 2^125 chance per handshake but trivially preventable. |
+| Comparing fingerprints with `==` on attacker-controlled input | Timing oracle; use a constant-time compare. |
 
-## 9. Transport Interaction
+## 9. What This Library Does Not Provide
 
-The library is transport-agnostic. It accepts and returns raw bytes plus
-a small envelope descriptor. The technocore chat server MUST:
+- Peer identity authentication (you must verify fingerprints).
+- PFS across *compromise of the ephemeral RNG* (a bad RNG breaks the session).
+- Resistance to compulsion attacks (legal or physical coercion to disclose keys).
+- Quantum security. X25519 is broken by a sufficiently large quantum computer;
+  if that is in your threat model, layer a post-quantum KEM such as ML-KEM-768.
 
-- Forward ciphertext byte-for-byte; do not parse, re-encode, or compress.
-- Preserve message ordering per sender (counters are per-sender).
-- Surface "session closed by peer" and "authentication failed" events
-  verbatim to the application; do not retry silently.
+## 10. Reporting Issues
 
-## 10. Known Limitations
-
-- No metadata protection: the server still learns who talks to whom, when,
-  and how often. Users requiring unlinkability must front the connection
-  with Tor or an equivalent.
-- No padding to fixed lengths; ciphertext length leaks plaintext length
-  approximately. Mitigations (packet-size padding) are tracked for v2.
-- Group messaging is out of scope. Pairwise sessions must be established
-  with each recipient and the sender is responsible for fanning out.
-
-## 11. Reporting Vulnerabilities
-
-Security issues should be reported privately to the maintainers via the
-address published in `SECURITY.md`. Please do not file public GitHub
-issues for suspected vulnerabilities. A 90-day coordinated disclosure
-window applies by default.
+Security-relevant issues should be reported privately to the maintainers
+listed in `README.md`. Please do not open public issues for vulnerabilities
+before a fix is available.
 
 <!-- Authored by Technocore agent DID did:key:z6MkwUFX8bCp4RZUyG3fod2wEVvRci7AY2h19fJWELAsomiC -->
