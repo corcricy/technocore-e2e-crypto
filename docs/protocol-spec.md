@@ -1,133 +1,131 @@
-# technocore E2E Protocol Specification
+# technocore-e2e-crypto Protocol Specification
 
-Version: 0.1.0  Status: Draft
+This document specifies the end-to-end encryption protocol implemented in this
+repository. It is the normative reference for any agent interoperating with
+`seal-scribe`-compatible peers.
 
-This document specifies the cryptographic wire format used by `technocore-e2e-crypto`. It is the normative reference for the implementation in `e2e/crypto.py`, `e2e/keys.py`, and `e2e/transport.py`.
+## 1. Goals
 
-## 1. Goals and Non-Goals
-
-Goals:
-- Provide confidentiality, integrity, and forward secrecy for point-to-point messages between two parties identified by long-term identity keys.
-- Be small, auditable, and dependency-light (only `cryptography`).
-- Support asynchronous operation: a sender may encrypt before it has observed any message from the recipient.
-
-Non-goals:
-- Group messaging, deniability, post-compromise security, and metadata protection are out of scope for v0.1.
-- This document does not define the on-wire transport framing; that is delegated to `e2e/transport.py`.
+* Confidentiality, integrity, and authenticity of messages between two peers.
+* Forward secrecy on a per-message basis.
+* Resistance to replay and reordering attacks.
+* Compact on-wire encoding (single base64url blob per message).
+* No reliance on a central key server during normal operation.
 
 ## 2. Cryptographic Primitives
 
-| Function            | Algorithm                                | Notes                                                                 |
-|---------------------|------------------------------------------|-----------------------------------------------------------------------|
-| Identity key        | Ed25519                                  | Used for signing and as a stable identifier (DID-style fingerprint).  |
-| Ephemeral key       | X25519                                   | Generated per session; never reused.                                  |
-| Key agreement       | X25519 ECDH                              | Raw shared secret is `Z = X25519(eph_priv, peer_eph_pub)`.             |
-| Key derivation      | HKDF-SHA-256                             | `salt = None`, `info = b"technocore-e2e-v1" + sender_id + receiver_id`.|
-| Symmetric cipher    | AES-256-GCM                              | 12-byte random nonce, 16-byte tag.                                    |
-| KDF input transcript| `Z || eph_pub_sender || eph_pub_receiver`| Fed into HKDF as the IKM.                                             |
+| Purpose             | Algorithm                                      |
+|---------------------|------------------------------------------------|
+| Identity keypair    | X25519 (Curve25519)                            |
+| Ephemeral keypair   | X25519, fresh per message                      |
+| Key derivation      | HKDF-SHA-256, salt = handshake context         |
+| Symmetric cipher    | AES-256-GCM                                   |
+| Fingerprint hash    | SHA-256 over raw 32-byte public key            |
+| Encoding            | base64url, no padding                          |
 
-All randomness is sourced from `os.urandom` / `cryptography` CSPRNG APIs.
+All primitives are provided by `cryptography` >= 41.0. No custom ciphers.
 
-## 3. Identifiers
+## 3. Identities and Long-Term Keys
 
-Each principal is identified by the 32-byte Ed25519 public key of its identity keypair, encoded as `did:key:z6Mk...`. The multibase prefix `z6Mk` corresponds to the multicodec `ed25519-pub` (0xED, 0x01).
-
-A short, human-friendly fingerprint is the lowercase hex of `BLAKE2b-256(identity_pub)[:8]`.
-
-## 4. Session Lifecycle
-
-A session binds a pair of identity keys to a chain of symmetric message keys. There are two phases.
-
-### 4.1 Handshake (one-time per session)
-
-The initiator generates an ephemeral X25519 keypair `(esk, epk)` and sends a `HELLO` envelope:
+Every peer holds an X25519 long-term keypair generated at startup. The
+private key is never transmitted. The public key is exchanged during the
+handshake (see Section 5). A short, human-verifiable fingerprint is derived
+as:
 
 ```
-HELLO = {
-  "v":       1,
-  "type":    "hello",
-  "from":    <sender identity pub, 32B>,
-  "to":      <receiver identity pub, 32B>,
-  "epk":     <ephemeral pub, 32B>,
-  "sig":     <Ed25519 sign(sk=identity_priv, msg=epk || to)>
-}
+fingerprint = base32(SHA256(public_key))[:16], grouped 4-4-4-4
 ```
 
-`sig` binds the ephemeral key to the claimed sender and intended recipient, preventing key-substitution attacks by a relay.
+This matches the helper `compute_fingerprint` exercised by
+`tests/test_key_fingerprint.py`.
 
-The responder verifies `sig` using `from`, then generates its own ephemeral `(resk, repk)` and replies with a `HELLO_ACK` envelope of the same shape.
+## 4. Nonce and Replay Protection
 
-Both sides compute:
+Two complementary mechanisms operate together:
 
-```
-Z        = X25519(esk, repk)
-IKM      = Z || epk || repk
-session  = HKDF-SHA-256(
-             ikm=IKM,
-             salt=None,
-             info=b"technocore-e2e-v1" + from + to,
-             length=32
-           )
-```
+1. **AEAD nonce uniqueness.** Each AES-GCM ciphertext uses a fresh random
+   96-bit nonce drawn from the per-peer `NonceManager`
+   (`e2e/nonce_manager.py`). A nonce is never reused with the same key.
 
-`session` is the 32-byte root key for the session.
+2. **Sliding-window replay defense.** Each side keeps the most recent N
+   message counters seen from its peer (default N = 64). A message with a
+   counter at or below the high-water mark but outside the window is
+   rejected. This is enforced by `e2e/replay_protection.py` and covered by
+   `tests/test_replay_protection.py`.
 
-### 4.2 Transport (per message)
+The combined 96-bit `nonce || counter` is bound into the AAD so a peer
+cannot be tricked into swapping nonces between sessions.
 
-A symmetric ratchet derives a per-direction message key from a 32-byte chain key, initialised to `session`. Each step:
+## 5. Handshake (Initial Key Agreement)
 
-```
-ck_{n+1} = HMAC-SHA-256(key=ck_n, msg=b"technocore-chain-v1")
-mk_n    = HMAC-SHA-256(key=ck_{n+1}, msg=b"technocore-msg-v1")
-```
+On first contact, peers perform an ephemeral X25519 exchange:
 
-The nonce for AES-GCM is `n.to_bytes(12, "big")`. Reuse of a `(key, nonce)` pair is prevented by the strictly increasing chain counter `n`.
+1. Alice generates ephemeral keypair `(eA_priv, eA_pub)`.
+2. Alice sends `eA_pub` plus her identity public key `iA_pub`.
+3. Bob generates `(eB_priv, eB_pub)` and replies with `eB_pub`, `iB_pub`.
+4. Both sides compute:
+   * `shared = X25519(e_self_priv, e_peer_pub)`
+   * `shared += X25519(e_self_priv, i_peer_pub)`
+   * `shared += X25519(i_self_priv, e_peer_pub)`
+   * `ikm = SHA256(shared)`
+   * `salt = SHA256(eA_pub || eB_pub || iA_pub || iB_pub)`
+5. `session_key = HKDF-SHA-256(salt=salt, ikm=ikm, info=b"technocore-e2e/v1", L=32)`
 
-The on-wire message body is:
+Triple DH defends against both passive eavesdropping and compromise of one
+party's long-term key, assuming the ephemeral key remains secret.
 
-```
-HEADER   (32B) : SHA-256(session)  -- session binding
-COUNTER  (8B)  : big-endian uint64 n
-NONCE    (12B) : per-message nonce (currently == counter, reserved for future randomness)
-CIPHERTEXT     : AES-256-GCM(mk_n, nonce, header || counter || nonce, plaintext)
-```
+## 6. Message Format
 
-The AAD binds the ciphertext to the session and counter, preventing cut-and-paste across sessions or reorder attacks that flip a counter.
-
-### 4.3 Rekey
-
-A rekey is required when the chain counter would exceed 2^48 or after 2^20 messages, whichever comes first. A rekey generates a fresh ephemeral pair and repeats the handshake, deriving a new `session` and resetting both chains to zero. The new session binding is the new header.
-
-## 5. Transport Framing
-
-`e2e/transport.py` provides length-prefixed framing over a duplex stream:
+A message on the wire is a single base64url string:
 
 ```
-[u32 BE length][length bytes payload]
+base64url( envelope )
+
+envelope = version(1) || flags(1) || counter(8, BE) || nonce(12) || ciphertext(N) || tag(16)
 ```
 
-A payload is one of the JSON-serialised envelopes defined in section 4. Implementations MUST NOT assume the underlying transport is confidential; the cryptographic envelope provides confidentiality independently.
+* `version`: currently `0x01`.
+* `flags`: bit 0 set indicates the last block of a logical message; future
+  bits reserved for fragmentation and key rotation.
+* `counter`: monotonically increasing per-direction, starting at 0.
+* `nonce`: the 12-byte AEAD nonce.
+* `ciphertext` and `tag`: AES-256-GCM output over plaintext bytes with
+  `AAD = version || flags || counter`.
 
-## 6. Error Handling
+This matches the round-trip property exercised by
+`tests/test_e2e_roundtrip.py`.
 
-- Invalid signature on `HELLO` / `HELLO_ACK`: abort the session, log at WARNING.
-- Counter regression or duplicate counter: abort, treat as active attack.
-- AAD or tag verification failure: abort, do NOT auto-rekey (an attacker should not be able to force rekey by tampering).
-- Session header mismatch: abort.
+## 7. Key Rotation
 
-## 7. Security Considerations
+Either peer may rotate its long-term identity key by sending a signed
+`rotate` envelope containing the new public key plus a signature computed
+under the *current* `session_key` (using the same AEAD with `info =
+b"rotate/v1"`). The receiver verifies, mixes the new identity into the next
+HKDF expansion, and acknowledges with a `rotate-ack` envelope. In-flight
+messages keyed to the old session are flushed before the switch.
 
-- Forward secrecy is per-session, not per-message. For higher assurance, applications SHOULD rekey frequently.
-- The protocol does not hide message length. Padding is the application's responsibility.
-- Compromise of a long-term identity key allows an attacker to impersonate that party to peers who have not authenticated the identity out-of-band. Pair `technocore-e2e-crypto` with a TOFU or out-of-band fingerprint check.
-- The session binding (`SHA-256(session)`) is logged in cleartext on the wire. A passive observer learns that two parties share a session, but not its contents.
+## 8. Error Handling
 
-## 8. Versioning
+Decryption or verification failures MUST NOT return a distinguishable
+error code to the network; peers respond with a generic `error` envelope
+under a fresh session key after re-handshaking. This prevents ciphertext
+oracle attacks against the AEAD tag.
 
-The `"v"` field of every envelope MUST be `1` for this specification. Future versions will be negotiated via a separate mechanism and are not covered here.
+## 9. Versioning
 
-## 9. Test Vectors
+The `version` byte in the envelope allows parallel support for future
+protocol revisions. Receivers MUST drop envelopes whose version they do
+not understand rather than attempting to parse speculatively.
 
-Test vectors live in `tests/test_crypto.py` and `tests/test_keys.py`. They cover: key generation determinism from a seed, HKDF output, a known-answer handshake, and a known-answer encrypted round-trip. Any change to the primitives or their concatenation order MUST be accompanied by an updated vector.
+## 10. Test Conformance Checklist
+
+An implementation claiming conformance MUST pass:
+
+* `tests/test_hkdf_derive.py` — HKDF inputs/outputs match RFC 5869 vectors.
+* `tests/test_key_fingerprint.py` — fingerprint derivation is stable.
+* `tests/test_replay_protection.py` — sliding window rejects replays.
+* `tests/test_e2e_roundtrip.py` — Alice -> Bob -> Alice plaintext recovery.
+
+This spec is the source of truth; tests are executable derivatives of it.
 
 <!-- Authored by Technocore agent DID did:key:z6MkwUFX8bCp4RZUyG3fod2wEVvRci7AY2h19fJWELAsomiC -->
