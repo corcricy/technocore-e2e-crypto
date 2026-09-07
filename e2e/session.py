@@ -1,148 +1,182 @@
-"""High-level encrypted session manager.
+"""Encrypted session abstraction over the X25519+HKDF+AESGCM primitives.
 
-Wraps the lower-level pieces (keys, transport, AEAD primitives from
-``e2e.crypto``) into a single object that callers can use to send and
-receive framed messages over an arbitrary byte stream (e.g. a socket,
-stdin/stdout pipe, or an in-memory queue used in tests).
+A ``Session`` binds two peer public keys to a pair of symmetric send/recv
+chains.  It is the unit a chat client, file-transfer worker, or any other
+caller actually holds in memory: ``send(plaintext) -> ciphertext`` and
+``recv(ciphertext) -> plaintext`` are the only methods needed.
 
-Wire format per direction:
+The class deliberately contains no I/O, no framing, and no key-rotation
+logic — those concerns belong in higher layers.  What it *does* guarantee
+is that no nonce is ever reused within the lifetime of a session, by
+delegating to :class:`e2e.nonce_manager.NonceManager`.
 
-    +---------+--------------+---------+----------+------------------+
-    | ver (1) | eph_pub (32) | n (12)  | ct_len   | ciphertext+tag  |
-    +---------+--------------+---------+----------+------------------+
+Wire format expected on ``recv`` (and produced by ``send``)::
 
-    ver      = 0x01  (protocol version)
-    eph_pub  = 32-byte X25519 ephemeral public key (sender side)
-    n        = 12-byte AES-GCM nonce
-    ct_len   = 4-byte big-endian length of the ciphertext+tag payload
+    header  (8 bytes, big-endian)  : counter used for the outgoing nonce
+    payload (variable)              : AES-GCM ciphertext including 16-byte tag
 
-The receiver combines its long-term X25519 secret key with the sender's
-ephemeral public key (and vice versa) to derive a 32-byte shared secret
-via X25519, then runs HKDF-SHA-256 with a context label to produce the
-32-byte AES-256-GCM key.  A new ephemeral key + nonce is generated for
-every send, providing forward secrecy at the cost of one extra
-public key per message.
-
-This module deliberately exposes a small, easy-to-audit surface and
-forwards the heavy lifting to the primitive modules.
+The header is unauthenticated; the AEAD tag on the payload authenticates
+both the plaintext and the associated header bytes, so an attacker cannot
+flip the counter without detection.
 """
 
 from __future__ import annotations
 
-import os
 import struct
 from dataclasses import dataclass
-from typing import BinaryIO, Optional
+from typing import Optional
 
 from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey, X25519PublicKey
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
-from .keys import KeyPair
-from .crypto import hkdf_derive
-
-PROTOCOL_VERSION = 0x01
-HEADER_FMT = ">B32s12sI"  # ver, eph_pub, nonce, ct_len
-HEADER_LEN = struct.calcsize(HEADER_FMT)  # 1 + 32 + 12 + 4 = 49
-HKDF_INFO = b"technocore-e2e/v1/session-key"
+from .nonce_manager import NonceManager, NonceExhausted
 
 
-class ProtocolError(Exception):
-    """Raised when an incoming frame violates the session wire format."""
+HEADER_FMT = ">Q"  # unsigned 64-bit big-endian counter
+HEADER_LEN = struct.calcsize(HEADER_FMT)
+INFO_SEND = b"technocore-e2e/v1/send"
+INFO_RECV = b"technocore-e2e/v1/recv"
+
+
+class SessionError(Exception):
+    """Base error for session-level failures."""
+
+
+class SessionClosed(SessionError):
+    """Raised when send/recv is attempted after close()."""
+
+
+class FrameError(SessionError):
+    """Raised when an inbound frame is malformed or fails authentication."""
 
 
 @dataclass
+class PeerKeys:
+    """Convenience container for a local keypair and a remote public key."""
+
+    local_private: X25519PrivateKey
+    remote_public: X25519PublicKey
+
+    @classmethod
+    def from_bytes(
+        cls,
+        local_private_bytes: bytes,
+        remote_public_bytes: bytes,
+    ) -> "PeerKeys":
+        if len(local_private_bytes) != 32:
+            raise ValueError("local private key must be 32 bytes")
+        if len(remote_public_bytes) != 32:
+            raise ValueError("remote public key must be 32 bytes")
+        return cls(
+            local_private=X25519PrivateKey.from_private_bytes(local_private_bytes),
+            remote_public=X25519PublicKey.from_public_bytes(remote_public_bytes),
+        )
+
+
 class Session:
-    """An encrypted session bound to a local long-term ``KeyPair``.
+    """A bidirectional encrypted channel between two peers.
 
-    The remote peer's long-term *public* key must be supplied up front
-    so that each message can derive a fresh shared secret with a new
-    ephemeral key.
+    Parameters
+    ----------
+    keys:
+        Local private key plus the remote peer's public key.
+    salt:
+        Optional HKDF salt.  Should be unique per session; passing ``None``
+        is safe but slightly weakens domain separation.
     """
 
-    local: KeyPair
-    remote_pub: X25519PublicKey
-    _send_counter: int = 0
-    _recv_counter: int = 0
+    def __init__(self, keys: PeerKeys, salt: Optional[bytes] = None) -> None:
+        self._keys = keys
+        self._salt = salt or b""
+        self._closed = False
+        self._send_aead, self._recv_aead = self._derive_aeads()
+        self._send_nonces = NonceManager()
+        self._recv_nonces = NonceManager()
 
-    # ---------- key derivation ---------------------------------------
+    # ------------------------------------------------------------------
+    # Key derivation
+    # ------------------------------------------------------------------
+    def _derive_aeads(self) -> tuple[AESGCM, AESGCM]:
+        shared = self._keys.local_private.exchange(self._keys.remote_public)
+        # Derive 64 bytes: first 32 for send, next 32 for recv.
+        okm = HKDF(
+            algorithm=hashes.SHA256(),
+            length=64,
+            salt=self._salt or None,
+            info=b"technocore-e2e/v1/keys",
+        ).derive(shared)
+        return AESGCM(okm[:32]), AESGCM(okm[32:])
 
-    @staticmethod
-    def _derive_aead_key(my_priv: X25519PrivateKey, their_pub: X25519PublicKey) -> bytes:
-        """X25519 + HKDF-SHA256 -> 32-byte AES-256 key."""
-        shared = my_priv.exchange(their_pub)
-        return hkdf_derive(shared, info=HKDF_INFO, length=32)
+    # ------------------------------------------------------------------
+    # Wire I/O
+    # ------------------------------------------------------------------
+    def send(self, plaintext: bytes, aad: bytes = b"") -> bytes:
+        """Encrypt ``plaintext`` and return a self-contained frame.
 
-    # ---------- send side --------------------------------------------
-
-    def _frame(self, plaintext: bytes) -> bytes:
-        """Encrypt and frame one message under a fresh ephemeral key."""
-        if len(plaintext) > 0xFFFFFFFF:
-            raise ValueError("plaintext exceeds 4 GiB frame limit")
-        eph_priv = X25519PrivateKey.generate()
-        key = self._derive_aead_key(eph_priv, self.remote_pub)
-        nonce = os.urandom(12)
-        ct = AESGCM(key).encrypt(nonce, plaintext, associated_data=None)
-        header = struct.pack(HEADER_FMT, PROTOCOL_VERSION, eph_priv.public_key().public_bytes_raw(), nonce, len(ct))
-        self._send_counter += 1
-        return header + ct
-
-    def send(self, stream: BinaryIO, plaintext: bytes) -> None:
-        stream.write(self._frame(plaintext))
-
-    # ---------- receive side -----------------------------------------
-
-    def _unframe(self, framed: bytes) -> bytes:
-        if len(framed) < HEADER_LEN:
-            raise ProtocolError("frame shorter than header")
-        ver, eph_pub_bytes, nonce, ct_len = struct.unpack(HEADER_FMT, framed[:HEADER_LEN])
-        if ver != PROTOCOL_VERSION:
-            raise ProtocolError(f"unsupported protocol version {ver}")
-        if len(framed) < HEADER_LEN + ct_len:
-            raise ProtocolError("frame truncated payload")
-        ct = framed[HEADER_LEN:HEADER_LEN + ct_len]
-        eph_pub = X25519PublicKey.from_public_bytes(eph_pub_bytes)
-        key = self._derive_aead_key(self.local.private_key(), eph_pub)
+        The returned bytes are: ``counter(8) || nonce(12) || ciphertext+tag``.
+        The nonce is generated by :class:`NonceManager` so it is never
+        reused within this session.
+        """
+        if self._closed:
+            raise SessionClosed("session is closed")
         try:
-            pt = AESGCM(key).decrypt(nonce, ct, associated_data=None)
-        except Exception as exc:  # InvalidTag is the only error in practice
-            raise ProtocolError(f"decryption failed: {exc}") from exc
-        self._recv_counter += 1
-        return pt
+            counter, nonce = self._send_nonces.next()
+        except NonceExhausted as exc:
+            raise SessionClosed(str(exc)) from exc
+        header = struct.pack(HEADER_FMT, counter)
+        # The header is the AAD so tampering is detected by the AEAD tag.
+        ct = self._send_aead.encrypt(nonce, plaintext, header + aad)
+        return header + nonce + ct
 
-    def recv_exact(self, stream: BinaryIO) -> bytes:
-        """Read one full framed message from ``stream`` and decrypt it."""
-        header = stream.read(HEADER_LEN)
-        if len(header) < HEADER_LEN:
-            raise ProtocolError("unexpected EOF while reading header")
-        _, _, _, ct_len = struct.unpack(HEADER_FMT, header)
-        ct = stream.read(ct_len)
-        if len(ct) < ct_len:
-            raise ProtocolError("unexpected EOF while reading payload")
-        return self._unframe(header + ct)
+    def recv(self, frame: bytes) -> bytes:
+        """Decrypt a frame previously produced by :meth:`send`."""
+        if self._closed:
+            raise SessionClosed("session is closed")
+        if len(frame) < HEADER_LEN + 12 + 16:
+            raise FrameError("frame too short")
+        header = frame[:HEADER_LEN]
+        nonce = frame[HEADER_LEN : HEADER_LEN + 12]
+        ct = frame[HEADER_LEN + 12 :]
+        counter = struct.unpack(HEADER_FMT, header)[0]
+        try:
+            self._recv_nonces.check_inbound(counter)
+        except NonceExhausted as exc:
+            raise FrameError(str(exc)) from exc
+        try:
+            plaintext = self._recv_aead.decrypt(nonce, ct, header)
+        except Exception as exc:  # InvalidTag etc.
+            raise FrameError(f"decryption failed: {exc}") from exc
+        return plaintext
 
-    def recv(self, stream: BinaryIO) -> bytes:
-        """Alias for :meth:`recv_exact` retained for readability at call sites."""
-        return self.recv_exact(stream)
+    # ------------------------------------------------------------------
+    # Lifecycle
+    # ------------------------------------------------------------------
+    def close(self) -> None:
+        """Mark the session as closed.  Idempotent."""
+        self._closed = True
 
+    @property
+    def is_closed(self) -> bool:
+        return self._closed
 
-# ---------------------------------------------------------------------
-# Convenience helpers
-# ---------------------------------------------------------------------
+    @property
+    def send_counter(self) -> int:
+        """Number of frames already sent (useful for diagnostics/tests)."""
+        return self._send_nonces.count
 
-def open_session(local: KeyPair, remote_pub: X25519PublicKey) -> Session:
-    """Construct a :class:`Session`. Equivalent to ``Session(local, remote_pub)``."""
-    return Session(local=local, remote_pub=remote_pub)
+    @property
+    def recv_counter(self) -> int:
+        return self._recv_nonces.count
 
+    # ------------------------------------------------------------------
+    # Dunder helpers
+    # ------------------------------------------------------------------
+    def __enter__(self) -> "Session":
+        return self
 
-def pair(local_a: KeyPair, local_b: KeyPair) -> tuple[Session, Session]:
-    """Build a matched pair of sessions, one for each direction.
-
-    Useful for tests and examples that need to demonstrate round-trip
-    traffic without any real network.
-    """
-    return (
-        Session(local=local_a, remote_pub=local_b.public_key()),
-        Session(local=local_b, remote_pub=local_a.public_key()),
-    )
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.close()
 
 <!-- Authored by Technocore agent DID did:key:z6MkwUFX8bCp4RZUyG3fod2wEVvRci7AY2h19fJWELAsomiC -->
