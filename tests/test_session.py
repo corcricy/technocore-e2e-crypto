@@ -1,127 +1,175 @@
-"""Tests for e2e/session.py — handshake state machine and message encrypt/decrypt."""
+"""Tests for e2e/session.py — end-to-end encrypted session lifecycle.
+
+Covers:
+  * Session establishment (initiator ↔ responder) yields matching symmetric keys.
+  * Encrypt/decrypt round-trip across many frames preserves plaintext and AAD.
+  * Reordered frames decrypt successfully (reorder tolerance).
+  * Forged ciphertext (bit-flip) fails authentication.
+  * Forged AAD fails authentication.
+  * Replay of an old frame within window is rejected.
+  * Session teardown prevents further encrypt/decrypt operations.
+
+These tests are intentionally self-contained: they build their own keypairs,
+negotiate a shared secret manually via X25519, and exercise the Session
+class without any network I/O.
+"""
+
+from __future__ import annotations
+
 import os
-import sys
+import time
+from typing import Tuple
+
 import pytest
 
-# Make repo root importable
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey, X25519PublicKey
 
-from e2e.session import (
-    SessionState,
-    HandshakeError,
-    encrypt_message,
-    decrypt_message,
-    derive_session_keys,
-    compute_handshake_hash,
-    serialize_public_key,
-    load_public_key,
-)
-from e2e.key_fingerprint import generate_keypair, fingerprint_public_key
+from e2e.session import Session, SessionError, SessionRole
 
 
-def _initiator():
-    return generate_keypair()
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
 
-def _responder():
-    return generate_keypair()
+def _keypair() -> Tuple[X25519PrivateKey, X25519PublicKey]:
+    priv = X25519PrivateKey.generate()
+    return priv, priv.public_key()
 
 
-def test_serialize_and_load_public_key_roundtrip():
-    sk, pk = generate_keypair()
-    raw = serialize_public_key(pk)
-    assert isinstance(raw, bytes) and len(raw) == 32
-    pk2 = load_public_key(raw)
-    assert pk2.public_bytes_raw() == pk.public_bytes_raw()
+def _establish_pair() -> Tuple[Session, Session]:
+    """Create two Sessions that share the same X25519 secret."""
+    a_priv, a_pub = _keypair()
+    b_priv, b_pub = _keypair()
+    shared_a = a_priv.exchange(b_pub)
+    shared_b = b_priv.exchange(a_pub)
+    assert shared_a == shared_b, "X25519 ECDH sanity check failed"
+
+    info = b"technocore-e2e/test-session/v1"
+    initiator = Session(
+        role=SessionRole.INITIATOR,
+        local_private=a_priv,
+        remote_public=b_pub,
+        info=info,
+    )
+    responder = Session(
+        role=SessionRole.RESPONDER,
+        local_private=b_priv,
+        remote_public=a_pub,
+        info=info,
+    )
+    return initiator, responder
 
 
-def test_handshake_hash_is_deterministic_and_distinct():
-    sk_a, pk_a = generate_keypair()
-    sk_b, pk_b = generate_keypair()
-    h1 = compute_handshake_hash(pk_a, pk_b)
-    h2 = compute_handshake_hash(pk_a, pk_b)
-    h3 = compute_handshake_hash(pk_b, pk_a)
-    assert h1 == h2
-    assert h1 != h3
-    assert len(h1) == 32
+# ---------------------------------------------------------------------------
+# Tests
+# ---------------------------------------------------------------------------
 
 
-def test_derive_session_keys_symmetric_for_both_sides():
-    sk_i, pk_i = generate_keypair()
-    sk_r, pk_r = generate_keypair()
-    k_i = derive_session_keys(sk_i, pk_r, pk_i)
-    k_r = derive_session_keys(sk_r, pk_i, pk_r)
-    # Both sides must agree on tx/rx keys (mirrored)
-    assert k_i.tx_key == k_r.rx_key
-    assert k_i.rx_key == k_r.tx_key
-    assert k_i.handshake_hash == k_r.handshake_hash
-    assert k_i.tx_nonce != k_r.tx_nonce  # directions must not collide
+def test_session_keys_match_after_establish() -> None:
+    a, b = _establish_pair()
+    assert a.tx_key == b.rx_key, "initiator TX must match responder RX"
+    assert a.rx_key == b.tx_key, "initiator RX must match responder TX"
+    assert a.tx_key != a.rx_key, "directions must derive distinct keys"
 
 
-def test_encrypt_decrypt_roundtrip():
-    sk_i, pk_i = generate_keypair()
-    sk_r, pk_r = generate_keypair()
-    keys_i = derive_session_keys(sk_i, pk_r, pk_i)
-    keys_r = derive_session_keys(sk_r, pk_i, pk_r)
-
-    plaintext = b"hello, technocore"
-    aad = b"msg-id:1"
-
-    nonce, ct = encrypt_message(keys_i, plaintext, aad=aad)
-    pt = decrypt_message(keys_r, nonce, ct, aad=aad)
-    assert pt == plaintext
+def test_roundtrip_many_frames() -> None:
+    a, b = _establish_pair()
+    for i in range(50):
+        plaintext = f"frame-{i}".encode().ljust(64, b"\x00")
+        aad = {"seq": i, "src": "alice", "dst": "bob"}
+        frame = a.encrypt(plaintext, aad=aad)
+        assert frame.seq == i
+        recovered, recovered_aad = b.decrypt(frame, expected_aad=aad)
+        assert recovered == plaintext
+        assert recovered_aad == aad
 
 
-def test_decrypt_fails_on_tampered_ciphertext():
-    sk_i, pk_i = generate_keypair()
-    sk_r, pk_r = generate_keypair()
-    keys_i = derive_session_keys(sk_i, pk_r, pk_i)
-    keys_r = derive_session_keys(sk_r, pk_i, pk_r)
-
-    nonce, ct = encrypt_message(keys_i, b"secret", aad=None)
-    tampered = bytearray(ct)
-    tampered[-1] ^= 0x01
-    tampered = bytes(tampered)
-    with pytest.raises(HandshakeError):
-        decrypt_message(keys_r, nonce, tampered, aad=None)
+def test_reorder_tolerance() -> None:
+    a, b = _establish_pair()
+    frames = []
+    for i in range(10):
+        frames.append(a.encrypt(b"msg-%d" % i, aad={"seq": i}))
+    # Deliver out of order
+    for f in reversed(frames):
+        pt, _ = b.decrypt(f, expected_aad={"seq": f.seq})
+        assert pt == b"msg-%d" % f.seq
 
 
-def test_decrypt_fails_on_wrong_aad():
-    sk_i, pk_i = generate_keypair()
-    sk_r, pk_r = generate_keypair()
-    keys_i = derive_session_keys(sk_i, pk_r, pk_i)
-    keys_r = derive_session_keys(sk_r, pk_i, pk_r)
+def test_forged_ciphertext_rejected() -> None:
+    a, b = _establish_pair()
+    frame = a.encrypt(b"hello", aad={"x": 1})
+    tampered = bytearray(frame.ciphertext)
+    tampered[0] ^= 0x01
+    from e2e.session import Frame
+    bad = Frame(
+        seq=frame.seq,
+        nonce=frame.nonce,
+        ciphertext=bytes(tampered),
+        tag=frame.tag,
+    )
+    with pytest.raises(SessionError):
+        b.decrypt(bad, expected_aad={"x": 1})
 
-    nonce, ct = encrypt_message(keys_i, b"secret", aad=b"msg:1")
-    with pytest.raises(HandshakeError):
-        decrypt_message(keys_r, nonce, ct, aad=b"msg:2")
+
+def test_forged_aad_rejected() -> None:
+    a, b = _establish_pair()
+    frame = a.encrypt(b"hello", aad={"role": "alice"})
+    with pytest.raises(SessionError):
+        b.decrypt(frame, expected_aad={"role": "eve"})
 
 
-def test_session_state_machine_transitions():
-    sk_i, pk_i = generate_keypair()
-    sk_r, pk_r = generate_keypair()
-    s_i = SessionState(initiator=True)
-    s_r = SessionState(initiator=False)
+def test_replay_within_window_rejected() -> None:
+    a, b = _establish_pair()
+    frame = a.encrypt(b"once", aad={"seq": 0})
+    # First delivery succeeds
+    b.decrypt(frame, expected_aad={"seq": 0})
+    # Replay must fail
+    with pytest.raises(SessionError):
+        b.decrypt(frame, expected_aad={"seq": 0})
 
-    # Fresh sessions are INIT
-    assert s_i.phase == "INIT"
-    assert s_r.phase == "INIT"
 
-    # Cannot encrypt before handshake completes
-    with pytest.raises(HandshakeError):
-        s_i.encrypt(b"nope")
+def test_teardown_blocks_use() -> None:
+    a, _ = _establish_pair()
+    a.close()
+    with pytest.raises(SessionError):
+        a.encrypt(b"nope", aad={})
 
-    s_i.set_remote_public_key(pk_r)
-    s_r.set_remote_public_key(pk_i)
-    s_i.complete_handshake()
-    s_r.complete_handshake()
-    assert s_i.phase == "ESTABLISHED"
-    assert s_r.phase == "ESTABLISHED"
 
-    # Now bidirectional encrypt/decrypt works through the state object
-    nonce, ct = s_i.encrypt(b"ping", aad=b"m:1")
-    assert s_r.decrypt(nonce, ct, aad=b"m:1") == b"ping"
-    nonce, ct = s_r.encrypt(b"pong", aad=b"m:2")
-    assert s_i.decrypt(nonce, ct, aad=b"m:2") == b"pong"
+def test_monotonic_seq_no_reuse() -> None:
+    a, b = _establish_pair()
+    seqs = []
+    for i in range(20):
+        f = a.encrypt(b"x", aad={"i": i})
+        seqs.append(f.seq)
+    assert seqs == list(range(20))
+    assert len(set(seqs)) == 20
+
+
+def test_key_derivation_is_deterministic() -> None:
+    """Same inputs → same Session keys (HKDF determinism)."""
+    a_priv = X25519PrivateKey.generate()
+    b_priv = X25519PrivateKey.generate()
+    shared = a_priv.exchange(b_priv.public_key())
+    info = b"test-info"
+
+    s1 = Session(SessionRole.INITIATOR, a_priv, b_priv.public_key(), info)
+    # Re-derive from raw shared secret to confirm match
+    from e2e.session import _derive_session_keys  # type: ignore[attr-defined]
+    k_tx, k_rx = _derive_session_keys(shared, info)
+    assert s1.tx_key == k_tx
+    assert s1.rx_key == k_rx
+
+
+def test_session_clock_skew_check() -> None:
+    """Decrypting with a wildly wrong expected timestamp in AAD fails."""
+    a, b = _establish_pair()
+    now = int(time.time())
+    frame = a.encrypt(b"ping", aad={"ts": now})
+    # Correct AAD works
+    b.decrypt(frame, expected_aad={"ts": now})
+    # Wrong timestamp is treated as AAD mismatch
+    with pytest.raises(SessionError):
+        b.decrypt(frame, expected_aad={"ts": now + 9999})
 
 <!-- Authored by Technocore agent DID did:key:z6MkwUFX8bCp4RZUyG3fod2wEVvRci7AY2h19fJWELAsomiC -->
